@@ -1,19 +1,18 @@
 //! Rate limiting for Rama applications using the governor crate
-//! 
+//!
 //! This crate provides a `GovernorPolicy` that can be used with Rama's `LimitLayer`
 //! for rate limiting HTTP requests or any other kind of request.
 
+use std::collections::HashSet;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use governor::{
-    state::{NotKeyed, StateStore},
-    DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota,
-};
-use once_cell::sync::OnceCell;
-use rama::layer::limit::policy::{Policy, PolicyOutput, PolicyResult};
+use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota};
+use once_cell::sync::{Lazy, OnceCell};
 use rama::Context;
+use rama::layer::limit::policy::{Policy, PolicyOutput, PolicyResult};
 use thiserror::Error;
 
 /// Error returned when rate limit is exceeded
@@ -47,7 +46,7 @@ pub trait AnyKeyedPolicy: fmt::Debug {
 }
 
 /// Keyed rate limiter policy
-pub struct KeyedPolicy<K, F> 
+pub struct KeyedPolicy<K, F>
 where
     K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     F: Fn(&str) -> K + Send + Sync + 'static,
@@ -78,11 +77,11 @@ where
         let key = (self.key_fn)(key_str);
         self.limiter.check_key(&key).map_err(|_| ())
     }
-    
+
     fn start_gc_if_needed(&self) {
         // GC implementation here
     }
-    
+
     fn gc_interval(&self) -> Duration {
         self.gc_interval
     }
@@ -91,16 +90,14 @@ where
 impl fmt::Debug for GovernorPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Direct(policy) => {
-                f.debug_struct("GovernorPolicy::Direct")
-                    .field("gc_interval", &policy.gc_interval)
-                    .finish()
-            }
-            Self::Keyed(policy) => {
-                f.debug_struct("GovernorPolicy::Keyed")
-                    .field("policy", policy)
-                    .finish()
-            }
+            Self::Direct(policy) => f
+                .debug_struct("GovernorPolicy::Direct")
+                .field("gc_interval", &policy.gc_interval)
+                .finish(),
+            Self::Keyed(policy) => f
+                .debug_struct("GovernorPolicy::Keyed")
+                .field("policy", policy)
+                .finish(),
         }
     }
 }
@@ -135,21 +132,25 @@ impl GovernorPolicyBuilder {
     }
 
     /// Set requests per second limit
-    /// 
+    ///
     /// This transitions the builder to the Initialized state.
     pub fn per_second(self, count: u32) -> GovernorPolicyBuilder {
         GovernorPolicyBuilder {
-            quota: Some(Quota::per_second(count.into())),
+            quota: Some(Quota::per_second(
+                NonZeroU32::new(count).expect("Rate limit count must be non-zero"),
+            )),
             gc_interval: self.gc_interval,
         }
     }
 
     /// Set requests per minute limit
-    /// 
+    ///
     /// This transitions the builder to the Initialized state.
     pub fn per_minute(self, count: u32) -> GovernorPolicyBuilder {
         GovernorPolicyBuilder {
-            quota: Some(Quota::per_minute(count.into())),
+            quota: Some(Quota::per_minute(
+                NonZeroU32::new(count).expect("Rate limit count must be non-zero"),
+            )),
             gc_interval: self.gc_interval,
         }
     }
@@ -159,7 +160,8 @@ impl GovernorPolicyBuilder {
     /// Set burst size for the rate limiter
     pub fn burst_size(mut self, size: u32) -> Self {
         if let Some(quota) = &mut self.quota {
-            *quota = quota.allow_burst(size.into());
+            *quota = quota
+                .allow_burst(NonZeroU32::new(size).expect("Rate limit count must be non-zero"));
         }
         self
     }
@@ -174,7 +176,7 @@ impl GovernorPolicyBuilder {
     pub fn build(self) -> GovernorPolicy {
         let quota = self.quota.expect("Quota must be set");
         let limiter = Arc::new(DefaultDirectRateLimiter::direct(quota));
-        
+
         GovernorPolicy::Direct(DirectPolicy {
             limiter,
             gc_interval: self.gc_interval,
@@ -189,13 +191,13 @@ impl GovernorPolicyBuilder {
     {
         let quota = self.quota.expect("Quota must be set");
         let limiter = Arc::new(DefaultKeyedRateLimiter::keyed(quota));
-        
+
         let keyed_policy = KeyedPolicy {
             limiter,
             key_fn,
             gc_interval: self.gc_interval,
         };
-        
+
         GovernorPolicy::Keyed(Box::new(keyed_policy))
     }
 }
@@ -212,14 +214,15 @@ impl GovernorPolicy {
     /// Start garbage collection if needed
     fn start_gc_if_needed(&self) {
         static DIRECT_GC_STARTED: OnceCell<()> = OnceCell::new();
-        static KEYED_GC_STARTED: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
+        static KEYED_GC_STARTED: Lazy<Mutex<HashSet<usize>>> =
+            Lazy::new(|| Mutex::new(HashSet::new()));
 
         match self {
             GovernorPolicy::Direct(policy) => {
                 DIRECT_GC_STARTED.get_or_init(|| {
                     let limiter = policy.limiter.clone();
                     let gc_interval = policy.gc_interval;
-                    
+
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(gc_interval);
                         loop {
@@ -233,13 +236,13 @@ impl GovernorPolicy {
                 // Use the pointer address as a unique identifier for this policy instance
                 let policy_ptr = policy as *const _ as usize;
                 let mut started = KEYED_GC_STARTED.lock().unwrap();
-                
+
                 if !started.contains(&policy_ptr) {
                     started.insert(policy_ptr);
-                    
+
                     // Start GC for this keyed policy
                     let interval = policy.gc_interval();
-                    
+
                     // Instead of cloning the policy, we'll just create a new task
                     // that calls the start_gc_if_needed method periodically
                     tokio::spawn(async move {
@@ -273,20 +276,18 @@ where
         self.start_gc_if_needed();
 
         match self {
-            GovernorPolicy::Direct(policy) => {
-                match policy.limiter.check() {
-                    Ok(_) => PolicyResult {
-                        ctx,
-                        request,
-                        output: PolicyOutput::Ready(()),
-                    },
-                    Err(_) => PolicyResult {
-                        ctx,
-                        request,
-                        output: PolicyOutput::Abort(GovernorError::RateLimited),
-                    },
-                }
-            }
+            GovernorPolicy::Direct(policy) => match policy.limiter.check() {
+                Ok(_) => PolicyResult {
+                    ctx,
+                    request,
+                    output: PolicyOutput::Ready(()),
+                },
+                Err(_) => PolicyResult {
+                    ctx,
+                    request,
+                    output: PolicyOutput::Abort(GovernorError::RateLimited),
+                },
+            },
             GovernorPolicy::Keyed(policy) => {
                 // Create a default key (in real applications, derive from request)
                 match policy.check_key("default") {
@@ -321,21 +322,21 @@ mod tests {
         // First two requests should succeed
         let result1 = policy.check(Context::default(), ()).await;
         let result2 = policy.check(Context::default(), ()).await;
-        
+
         match result1.output {
-            PolicyOutput::Ready(_) => {},
+            PolicyOutput::Ready(_) => {}
             _ => panic!("Expected Ready"),
         }
-        
+
         match result2.output {
-            PolicyOutput::Ready(_) => {},
+            PolicyOutput::Ready(_) => {}
             _ => panic!("Expected Ready"),
         }
 
         // Third request should be rate limited
         let result3 = policy.check(Context::default(), ()).await;
         match result3.output {
-            PolicyOutput::Abort(GovernorError::RateLimited) => {},
+            PolicyOutput::Abort(GovernorError::RateLimited) => {}
             _ => panic!("Expected Abort"),
         }
     }
