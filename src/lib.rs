@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota};
 use once_cell::sync::{Lazy, OnceCell};
-use rama::Context;
-use rama::layer::limit::policy::{Policy, PolicyOutput, PolicyResult};
+use rama_core::Context;
+use rama_core::layer::limit::policy::{Policy, PolicyOutput, PolicyResult};
 use thiserror::Error;
 
 /// Error returned when rate limit is exceeded
@@ -101,10 +101,6 @@ impl fmt::Debug for GovernorPolicy {
         }
     }
 }
-
-// Static tracker for the GC task
-static GC_TASK: OnceCell<()> = OnceCell::new();
-static GC_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Marker types for type state pattern
 pub struct Uninitialized;
@@ -220,7 +216,6 @@ impl GovernorPolicy {
         match self {
             GovernorPolicy::Direct(policy) => {
                 DIRECT_GC_STARTED.get_or_init(|| {
-                    let limiter = policy.limiter.clone();
                     let gc_interval = policy.gc_interval;
 
                     tokio::spawn(async move {
@@ -277,30 +272,43 @@ where
 
         match self {
             GovernorPolicy::Direct(policy) => match policy.limiter.check() {
-                Ok(_) => PolicyResult {
-                    ctx,
-                    request,
-                    output: PolicyOutput::Ready(()),
-                },
-                Err(_) => PolicyResult {
-                    ctx,
-                    request,
-                    output: PolicyOutput::Abort(GovernorError::RateLimited),
-                },
-            },
-            GovernorPolicy::Keyed(policy) => {
-                // Create a default key (in real applications, derive from request)
-                match policy.check_key("default") {
-                    Ok(_) => PolicyResult {
+                Ok(_) => {
+                    tracing::debug!("Rate limit check passed for direct limiter");
+                    PolicyResult {
                         ctx,
                         request,
                         output: PolicyOutput::Ready(()),
-                    },
-                    Err(_) => PolicyResult {
+                    }
+                }
+                Err(_) => {
+                    tracing::info!("Rate limit exceeded for direct limiter");
+                    PolicyResult {
                         ctx,
                         request,
                         output: PolicyOutput::Abort(GovernorError::RateLimited),
-                    },
+                    }
+                }
+            },
+            GovernorPolicy::Keyed(policy) => {
+                // Create a default key (in real applications, derive from request)
+                let key = "default";
+                match policy.check_key(key) {
+                    Ok(_) => {
+                        tracing::debug!("Rate limit check passed for key: {}", key);
+                        PolicyResult {
+                            ctx,
+                            request,
+                            output: PolicyOutput::Ready(()),
+                        }
+                    }
+                    Err(_) => {
+                        tracing::info!("Rate limit exceeded for key: {}", key);
+                        PolicyResult {
+                            ctx,
+                            request,
+                            output: PolicyOutput::Abort(GovernorError::RateLimited),
+                        }
+                    }
                 }
             }
         }
@@ -310,7 +318,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn test_governor_policy() {

@@ -16,25 +16,25 @@
 //! - Specific paths get different limits
 //! - Different HTTP methods get different limits
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
-
-use rama::{
+use rama_core::{
     Context, Layer,
     error::BoxError,
-    http::{IntoResponse, Request, Response, StatusCode, matcher::HttpMatcher, server::HttpServer},
     layer::limit::{LimitLayer, policy::LimitReached},
-    net::stream::matcher::SocketMatcher,
+    layer::{MapResultLayer, TraceErrLayer},
     rt::Executor,
+    service::service_fn,
 };
+use rama_http::{
+    HeaderName, HeaderValue, IntoResponse, Request, Response, StatusCode, matcher::HttpMatcher,
+    response::Json,
+};
+use rama_http_backend::server::HttpServer;
+use rama_net::stream::matcher::SocketMatcher;
 use rama_x_governor::GovernorPolicy;
+use std::{sync::Arc, time::Duration};
 
 use std::convert::Infallible;
 
-use rama::{
-    http::{HeaderName, HeaderValue, response::Json},
-    layer::{MapResultLayer, TraceErrLayer},
-    service::service_fn,
-};
 use serde_json::json;
 
 async fn slow_endpoint(_: Context<()>) -> impl IntoResponse {
