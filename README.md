@@ -52,8 +52,7 @@ let governor = GovernorPolicy::builder()
 
 Check out the examples directory for complete working examples:
 
-- `http_rate_limit.rs` - Basic HTTP rate limiting
-- `ip_rate_limit.rs` - IP-based rate limiting
+- `matcher_policy_rate_limit.rs` - Basic HTTP rate limiting
 
 ## Attribution
 
